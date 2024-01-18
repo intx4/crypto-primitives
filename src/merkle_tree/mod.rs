@@ -5,9 +5,11 @@ use crate::crh::TwoToOneCRHScheme;
 use crate::{crh::CRHScheme, Error};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::borrow::Borrow;
-use ark_std::collections::{BTreeSet, HashMap};
+use ark_std::collections::BTreeSet;
 use ark_std::hash::Hash;
 use ark_std::vec::Vec;
+use std::sync::Arc;
+use dashmap::DashMap;
 
 #[cfg(test)]
 mod tests;
@@ -300,7 +302,7 @@ impl<P: Config> MultiPath<P> {
     /// * `leaf_size`: leaf size in number of bytes
     ///
     /// `verify` infers the tree height by setting `tree_height = self.auth_paths_suffixes[0].len() + 2`
-    pub fn verify<L: Borrow<P::Leaf> + Clone>(
+    pub fn verify<L: Borrow<P::Leaf> + Clone + std::marker::Sync + Send>(
         &self,
         leaf_hash_params: &LeafParam<P>,
         two_to_one_params: &TwoToOneParam<P>,
@@ -309,64 +311,78 @@ impl<P: Config> MultiPath<P> {
     ) -> Result<bool, crate::Error> {
         // array of auth paths as arrays of InnerDigests
 
-        let mut leaves = leaves.into_iter();
+        let leaves = leaves.into_iter().collect::<Vec<_>>();
 
-        let mut auth_paths = self.decompress()?.peekable();
+        let auth_paths = self.decompress()?.collect::<Vec<Vec<_>>>();
 
-        let tree_height = auth_paths.peek().unwrap().len() + 2;
+        let tree_height = auth_paths[0].len() + 2;
 
         // LookUp table to speedup computation avoid redundant hash computations
-        let mut hash_lut: HashMap<usize, P::InnerDigest> = HashMap::new();
+        let hash_lut: Arc<DashMap<usize, P::InnerDigest>> = Arc::new(DashMap::new());
 
-        for i in 0..self.leaf_indexes.len() {
-            let leaf_index = self.leaf_indexes[i];
-            let leaf = leaves.next().unwrap();
-            let leaf_sibling_hash = &self.leaf_siblings_hashes[i];
-            let auth_path = auth_paths.next().unwrap();
+        // TODO:
+        // this causes a deadlock somewhere probably
+        // -> test merkle_tree::tests::bytes_mt_tests::good_root_test has been running for over 60 seconds
+        let mut res: Vec<bool> = cfg_into_iter!(0..self.leaf_indexes.len())
+            .map( |i| {
+                let hash_lut = Arc::clone(&hash_lut);
 
-            let claimed_leaf_hash = P::LeafHash::evaluate(&leaf_hash_params, leaf.clone())?;
-            let (left_child, right_child) =
-                select_left_right_child(leaf_index, &claimed_leaf_hash, &leaf_sibling_hash)?;
-            // check hash along the path from bottom to root
+                let leaf_index = self.leaf_indexes[i];
+                let leaf = &leaves[i];
+                let leaf_sibling_hash = &self.leaf_siblings_hashes[i];
+                let auth_path = &auth_paths[i];
 
-            // leaf layer to inner layer conversion
-            let left_child = P::LeafInnerDigestConverter::convert(left_child)?;
-            let right_child = P::LeafInnerDigestConverter::convert(right_child)?;
+                let claimed_leaf_hash = P::LeafHash::evaluate(&leaf_hash_params, leaf.clone())?;
+                let (left_child, right_child) =
+                    select_left_right_child(leaf_index, &claimed_leaf_hash, &leaf_sibling_hash)?;
+                // check hash along the path from bottom to root
+    
+                // leaf layer to inner layer conversion
+                let left_child = P::LeafInnerDigestConverter::convert(left_child)?;
+                let right_child = P::LeafInnerDigestConverter::convert(right_child)?;
+    
+                // we will use `index` variable to track the position of path
+                let mut index = leaf_index;
+                let mut index_in_tree = convert_index_to_last_level(leaf_index, tree_height);
+                index >>= 1;
+                index_in_tree = parent(index_in_tree).unwrap();
 
-            // we will use `index` variable to track the position of path
-            let mut index = leaf_index;
-            let mut index_in_tree = convert_index_to_last_level(leaf_index, tree_height);
-            index >>= 1;
-            index_in_tree = parent(index_in_tree).unwrap();
-
-            let mut curr_path_node =
+                let mut curr_path_node =
                 hash_lut
                     .entry(index_in_tree)
                     .or_insert(P::TwoToOneHash::evaluate(
                         &two_to_one_params,
                         left_child,
                         right_child,
-                    )?);
+                    )?).clone();
 
-            // Check levels between leaf level and root
-            for level in (0..auth_path.len()).rev() {
-                // check if path node at this level is left or right
-                let (left, right) =
-                    select_left_right_child(index, curr_path_node, &auth_path[level])?;
-                // update curr_path_node
-                index >>= 1;
-                index_in_tree = parent(index_in_tree).unwrap();
-                curr_path_node = hash_lut
-                    .entry(index_in_tree)
-                    .or_insert(P::TwoToOneHash::compress(&two_to_one_params, left, right)?);
-            }
+                // Check levels between leaf level and root
+                for level in (0..auth_path.len()).rev() {
+                    // check if path node at this level is left or right
+                    let (left, right) =
+                        select_left_right_child(index, &curr_path_node, &auth_path[level])?;
+                    // update curr_path_node
+                    index >>= 1;
+                    index_in_tree = parent(index_in_tree).unwrap();
+                    curr_path_node = hash_lut
+                        .entry(index_in_tree)
+                        .or_insert(P::TwoToOneHash::compress(&two_to_one_params, left, right)?).clone();
+                }
 
-            // check if final hash is root
-            if curr_path_node != root_hash {
-                return Ok(false);
-            }
+                // check if final hash is root
+                if curr_path_node != *root_hash {
+                    Ok(false)
+                }else{
+                    Ok(true)
+                }
+            }).collect::<Result<Vec<bool>,crate::Error>>()?;
+        
+        res = res.into_iter().filter(|r| *r == false).collect();
+        if res.len() > 0{
+            Ok(false)
+        }else{
+            Ok(true)
         }
-        Ok(true)
     }
 
     /// The position of on_path node in `leaf_and_sibling_hash` and `non_leaf_and_sibling_hash_path`.
