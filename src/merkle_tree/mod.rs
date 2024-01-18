@@ -330,7 +330,7 @@ impl<P: Config> MultiPath<P> {
         // this causes a deadlock somewhere probably
         // -> test merkle_tree::tests::bytes_mt_tests::good_root_test has been running for over 60 seconds
         let mut res: Vec<bool> = cfg_into_iter!(0..self.leaf_indexes.len())
-            .map( |i| {
+            .map(|i| {
                 let hash_lut = Arc::clone(&hash_lut);
 
                 let leaf_index = self.leaf_indexes[i];
